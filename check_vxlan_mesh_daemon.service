@@ -1,0 +1,18 @@
+[Unit]
+Description=Daemon for check_vxlan_mesh checks
+After=rabbitmq-server.service
+Wants=
+Requires=rabbitmq-server.service
+
+[Service]
+Restart=on-failure
+StartLimitInterval=20
+StartLimitBurst=5
+TimeoutStartSec=0
+RestartSec=5
+SyslogIdentifier=check_vxlan_mesh_daemon
+ExecStart=/usr/local/bin/check_vxlan_mesh_daemon
+
+[Install]
+WantedBy=multi-user.target
+

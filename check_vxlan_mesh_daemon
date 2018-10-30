@@ -1,0 +1,77 @@
+#!/usr/bin/python
+import MySQLdb     # pSQL setzt auf MySQLdb auf
+import json
+import pika
+import ConfigParser
+
+# Read Config
+config = ConfigParser.ConfigParser()
+config.read('/etc/check_vxlan_mesh.ini')
+
+# RabbitMQ
+rabbitmq_connection_url = config.get('rabbitmq', 'connection_url')
+rabbitmq_exchange = config.get('rabbitmq', 'exchange')
+
+# MySQL
+mysql_db_host = config.get('mysql', 'host')
+mysql_db_user = config.get('mysql', 'user')
+mysql_db_passwd = config.get('mysql', 'passwd')
+mysql_db = 'neutron'
+
+# openstack
+openstack_release = config.get('openstack', 'release')
+
+#
+# MAIN
+#
+
+# RabbitMQ Connection
+connection = pika.BlockingConnection(pika.URLParameters(rabbitmq_connection_url))
+
+channel = connection.channel()
+channel.exchange_declare(exchange=rabbitmq_exchange, exchange_type='direct')
+result = channel.queue_declare(rabbitmq_exchange + '_control')
+queue_name = result.method.queue
+channel.queue_bind(exchange='check_vxlan_mesh', queue=queue_name, routing_key='control')
+
+def recv_callback(ch, method, properties, body):
+    print ("Got Request:" + body)
+    request = json.loads(body)
+    reply_fqdn = request['fqdn']
+    data = {}
+
+    # MySQL Connection
+    db = MySQLdb.connect(host=mysql_db_host, user=mysql_db_user, passwd=mysql_db_passwd, db=mysql_db)
+
+    cur = db.cursor()
+
+    sql = "select network_id from ports GROUP BY network_id"
+    cur.execute(sql)
+    result_network_ids = cur.fetchall()
+
+    for row in result_network_ids:
+        ips = []
+        network_id = row[0]
+        sql = "select ip_address from ( select host from ml2_port_bindings LEFT JOIN ports ON port_id = ports.id WHERE host != '' AND "
+        if openstack_release == 'newton':
+            sql += "  status = 'ACTIVE' "
+        else:
+            sql += " ml2_port_bindings.status = 'ACTIVE' AND ports.status = 'ACTIVE' AND ports.admin_state_up = 1 "
+        sql += " AND network_id = '" + network_id + "' GROUP BY host ) sub LEFT JOIN ml2_vxlan_endpoints ON sub.host = ml2_vxlan_endpoints.host;"
+        cur.execute(sql)
+        for row_ip in cur.fetchall():
+            ips.append(row_ip[0])
+        data[network_id] = ips
+
+    db.close()
+    json_string = json.dumps(data)
+    channel.basic_publish(exchange='check_vxlan_mesh',
+                  routing_key=reply_fqdn,
+                  body=json_string)
+    print(" [x] Sent " + json_string + " to " + reply_fqdn)
+
+
+channel.basic_consume(recv_callback, queue=queue_name, no_ack=True)
+print(' [*] Waiting for messages. To exit press CTRL+C')
+channel.start_consuming()
+
