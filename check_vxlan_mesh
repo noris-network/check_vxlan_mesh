@@ -1,0 +1,157 @@
+#!/usr/bin/python
+import pprint
+import subprocess
+import json
+import re
+import pika
+import socket
+import signal
+import ConfigParser
+import sys
+
+# Read Config
+config = ConfigParser.ConfigParser()
+config.read('/etc/check_vxlan_mesh.ini')
+
+def handler(signum, frame):
+    print 'Signal handler called with signal', signum
+    raise RuntimeError("Timeout while waiting for reply")
+
+signal.signal(signal.SIGALRM, handler)
+signal.alarm(10)
+
+pp = pprint.PrettyPrinter(indent=4)
+fqdn = socket.getfqdn()
+ovs_vsctl_connection = "tcp:127.0.0.1:6640"
+
+# RabbitMQ
+rabbitmq_connection_url = config.get('rabbitmq', 'connection_url')
+rabbitmq_exchange = config.get('rabbitmq', 'exchange')
+
+connection = pika.BlockingConnection(pika.URLParameters(rabbitmq_connection_url))
+
+# define rabbitmq channel, exchange and queue
+channel = connection.channel()
+channel.exchange_declare(exchange=rabbitmq_exchange, exchange_type='direct')
+result = channel.queue_declare(exclusive=True)
+queue_name = result.method.queue
+channel.queue_bind(exchange=rabbitmq_exchange, queue=queue_name, routing_key=fqdn)
+
+ret_value = 0
+
+def debug(msg):
+    print (msg)
+    return 0
+
+def send_request(connection):
+    #
+    # Sends msg to exchange with routing_key 'control'
+    #
+    # this msg will be processed by control-nodes and answered with routing_key 'fqdn'
+    #
+    data = {}
+    channel = connection.channel()
+
+    data['fqdn'] = fqdn
+    json_string = json.dumps(data)
+    channel.basic_publish(exchange=rabbitmq_exchange, routing_key='control', body=json_string)
+    debug("Sent Req: " + json_string)
+
+def recv_reply(body):
+    #
+    # Process given json-data
+    #
+    data = json.loads(body)
+
+    net_map = {}
+    ret_value = 0
+
+    debug("---")
+    debug("Input JSON")
+    debug("---")
+    debug(pp.pformat(data))
+
+    #
+    # Erzeuge liste der VXLAN-Port-IDs
+    #
+    debug("---")
+    debug("VXLAN-Port-IDs")
+    debug("---")
+    output = subprocess.check_output(["/usr/bin/ovs-vsctl --db=" + ovs_vsctl_connection + " -f csv -- --columns=ofport,options list Interface"], shell=True).split('\n')
+
+    for network_id in data:
+      ips = data[network_id]
+      ports = []
+      for line in output:
+        if 'remote_ip' in line:
+            split = line.split(',', 1)
+            port_id = split[0]
+            port_data = split[1]
+            for ip in ips:
+              if 'remote_ip=""' + ip in port_data:
+                ports.append(port_id)
+      net_map[network_id] = { 'ports': ports}
+
+    debug(pp.pformat(net_map))
+    #
+    # Erzeuge network_uuid <-> local-VLAN - Mapping
+    #
+    debug("---")
+    debug("network_uuid <-> VLAN - MAPPING")
+    debug("---")
+    ovs_ports = subprocess.check_output(["/usr/bin/ovs-vsctl --db=" + ovs_vsctl_connection + " --no-headings --columns=other_config list Port"], shell=True).split('\n')
+    for port in ovs_ports:
+        if "net_uuid" in port:
+          for network_id in data:
+            if network_id in port:
+              vlan_id = re.search(r'tag="([0-9]+)"', port).group(1)
+              net_map[network_id]['vlan_id'] = vlan_id
+
+
+    debug(pp.pformat(net_map))
+
+    #
+    # Pruefe Tunnel
+    #
+    flows = subprocess.check_output(["sudo /usr/bin/ovs-ofctl --read-only dump-flows br-tun table=22 | egrep -o 'dl_vlan.*'"], shell=True).splitlines()
+
+    debug("Flows: ")
+    debug(pp.pformat(flows))
+    for flow in flows:
+      try:
+          flow_vlan_id = re.match(r'dl_vlan=([0-9]+)', flow).group(1)
+          outputs = re.findall(r'output:([0-9]+)', flow)
+      except:
+        debug("unable to process line: " + flow)
+        continue
+        
+      for network_uuid in net_map:
+        try:
+          net_map[network_uuid]['vlan_id']
+        except:
+          continue
+        
+        if flow_vlan_id == net_map[network_uuid]['vlan_id']:
+            debug(network_uuid + " is using VLAN " + flow_vlan_id)
+            missing_outputs = net_map[network_uuid]['ports']
+            for output in outputs:
+              try:
+                missing_outputs.remove(output)
+              except:
+                debug("Hint! There are vxlan-tunnel-ports we didnt expect! => output:" + output)
+            if len(missing_outputs) > 0:
+              print('Crit! ' + network_uuid + ' has missing outputs:' + pp.pformat(missing_outputs))
+              ret_value = 2
+    return ret_value
+
+debug('Sending Req to Control')
+send_request(connection)
+debug('Waiting for messages in queue:' + queue_name + ' To exit press CTRL+C')
+for method, properties, body in channel.consume(queue_name):
+    ret_value = recv_reply(body)
+    break
+
+connection.close()
+
+exit(ret_value)
+
